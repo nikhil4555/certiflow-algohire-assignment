@@ -1,0 +1,75 @@
+﻿# =============================================================================
+# CertiFlow — DEV Infrastructure Only
+# =============================================================================
+# Runs only the infrastructure services (Postgres, Redis, S3, Mock WhatsApp).
+# The backend and frontend run locally with hot reload — NOT in Docker.
+#
+# COMMANDS:
+#   Start (foreground): docker-compose -f docker-compose.dev.yml up
+#   Start (background): docker-compose -f docker-compose.dev.yml up -d
+#   Stop:               docker-compose -f docker-compose.dev.yml down
+#   Wipe data (reset):  docker-compose -f docker-compose.dev.yml down -v
+#   Rebuild mock-wa:    docker-compose -f docker-compose.dev.yml up --build
+#
+# THEN IN SEPARATE TERMINALS:
+#   cd backend  && npm run dev          -> API server on http://localhost:3000
+#   cd backend  && npm run dev:worker   -> BullMQ certificate + WhatsApp workers
+#   cd frontend && npm run dev          -> React UI on http://localhost:5173
+#
+# SERVICES:
+#   Postgres        localhost:5432   (DB: certiflow | user: certiflow | pass: certiflow)
+#   Redis           localhost:6379
+#   S3 (LocalStack) localhost:4566   (S3-compatible, any access key accepted)
+#   Mock WhatsApp   localhost:4000   (GET /messages to inspect sent messages)
+# =============================================================================
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: certiflow
+      POSTGRES_USER: certiflow
+      POSTGRES_PASSWORD: certiflow
+    volumes:
+      - pg_data_dev:/var/lib/postgresql/data
+    ports:
+      - 5432:5432
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - 6379:6379
+
+  # LocalStack — S3-compatible object storage, no Docker Hub auth required.
+  # Replaces MinIO (all MinIO image variants require registry login).
+  # API is identical S3: use the same AWS SDK / MinIO client, just point to port 4566.
+  minio:
+    image: localstack/localstack:3.0
+    environment:
+      SERVICES: s3
+      AWS_DEFAULT_REGION: us-east-1
+    volumes:
+      - minio_data_dev:/var/lib/localstack
+    ports:
+      - 4566:4566
+    healthcheck:
+      test: ['CMD', 'curl', '-f', 'http://localhost:4566/_localstack/health']
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  mock-whatsapp:
+    build:
+      context: ./mock-whatsapp
+      dockerfile: Dockerfile
+    ports:
+      - 4000:4000
+    environment:
+      PORT: 4000
+      FAILURE_RATE: 0.3
+      TIMEOUT_RATE: 0.1
+
+volumes:
+  pg_data_dev:
+  minio_data_dev:

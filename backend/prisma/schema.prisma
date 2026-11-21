@@ -1,0 +1,204 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─── Enums ────────────────────────────────────────────────────────────────
+
+enum Role {
+  TRAINING_CENTRE
+  DISTRICT_OFFICER
+  QUALITY_TEAM
+  STATE_OFFICE
+}
+
+// State machine for a batch. Valid transitions:
+// DRAFT → DISTRICT_REVIEW (on submit)
+// DISTRICT_REVIEW → QUALITY_REVIEW (large batch, district approved)
+// DISTRICT_REVIEW → STATE_REVIEW (small batch, district approved)
+// QUALITY_REVIEW → STATE_REVIEW (quality approved)
+// STATE_REVIEW → APPROVED (state approved)
+// Any active stage → REJECTED or RETURNED
+// RETURNED → DISTRICT_REVIEW (on resubmit)
+enum BatchStatus {
+  DRAFT
+  DISTRICT_REVIEW
+  QUALITY_REVIEW
+  STATE_REVIEW
+  APPROVED
+  REJECTED
+  RETURNED
+}
+
+enum ApprovalStage {
+  DISTRICT
+  QUALITY
+  STATE
+}
+
+enum ApprovalAction {
+  APPROVED
+  REJECTED
+  RETURNED
+}
+
+enum CertificateStatus {
+  ACTIVE
+  CANCELLED
+}
+
+enum DeliveryStatus {
+  PENDING
+  SENT
+  FAILED
+}
+
+// ─── Models ───────────────────────────────────────────────────────────────
+
+model District {
+  id                String   @id @default(uuid())
+  name              String
+  // How many district officers must approve before the batch advances.
+  // Configurable per district so different districts can have different thresholds.
+  requiredApprovals Int      @default(2) @map("required_approvals")
+  users             User[]
+  batches           Batch[]
+  createdAt         DateTime @default(now()) @map("created_at")
+
+  @@map("districts")
+}
+
+model User {
+  id         String    @id @default(uuid())
+  email      String    @unique
+  name       String
+  password   String
+  role       Role
+  // Officers belong to a district. Training centres also have a district for routing.
+  // Quality team and state office have no district (null).
+  districtId String?   @map("district_id")
+  district   District? @relation(fields: [districtId], references: [id])
+
+  // Relations
+  batches               Batch[]         @relation("TrainingCentreBatches")
+  approvals             BatchApproval[]
+  cancelledCertificates Certificate[]   @relation("CancelledBy")
+  auditEvents           BatchEvent[]
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@map("users")
+}
+
+model Batch {
+  id               String      @id @default(uuid())
+  trainingCentreId String      @map("training_centre_id")
+  trainingCentre   User        @relation("TrainingCentreBatches", fields: [trainingCentreId], references: [id])
+  districtId       String      @map("district_id")
+  district         District    @relation(fields: [districtId], references: [id])
+  status           BatchStatus @default(DRAFT)
+  candidateCount   Int         @default(0) @map("candidate_count")
+  // Populated when batch is sent back — training centre sees why
+  returnReason     String?     @map("return_reason")
+  submittedAt      DateTime?   @map("submitted_at")
+  createdAt        DateTime    @default(now()) @map("created_at")
+  updatedAt        DateTime    @updatedAt @map("updated_at")
+
+  candidates   Candidate[]
+  approvals    BatchApproval[]
+  events       BatchEvent[]
+  certificates Certificate[]
+
+  @@map("batches")
+}
+
+model Candidate {
+  id         String  @id @default(uuid())
+  batchId    String  @map("batch_id")
+  batch      Batch   @relation(fields: [batchId], references: [id], onDelete: Cascade)
+  name       String
+  phone      String
+  courseName String  @map("course_name")
+  score      Decimal
+
+  // certificate is a 1-to-1 relation — UNIQUE enforced at DB level.
+  // Even if the generation job runs twice, the second INSERT fails. No duplicate certs.
+  certificate Certificate?
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@map("candidates")
+}
+
+model Certificate {
+  id                String            @id @default(uuid())
+  // Public-facing number embedded in the PDF and QR code.
+  // Non-sequential — hard to guess or enumerate.
+  certificateNumber String            @unique @map("certificate_number")
+  // UNIQUE ensures one candidate can never have two certificates — enforced at DB level
+  candidateId       String            @unique @map("candidate_id")
+  candidate         Candidate         @relation(fields: [candidateId], references: [id])
+  batchId           String            @map("batch_id")
+  batch             Batch             @relation(fields: [batchId], references: [id])
+  pdfUrl            String?           @map("pdf_url")
+  status            CertificateStatus @default(ACTIVE)
+  issuedAt          DateTime          @default(now()) @map("issued_at")
+  cancelledAt       DateTime?         @map("cancelled_at")
+  cancelledById     String?           @map("cancelled_by_id")
+  cancelledBy       User?             @relation("CancelledBy", fields: [cancelledById], references: [id])
+
+  deliveries WhatsappDelivery[]
+
+  @@map("certificates")
+}
+
+model BatchApproval {
+  id        String         @id @default(uuid())
+  batchId   String         @map("batch_id")
+  batch     Batch          @relation(fields: [batchId], references: [id])
+  officerId String         @map("officer_id")
+  officer   User           @relation(fields: [officerId], references: [id])
+  stage     ApprovalStage
+  action    ApprovalAction
+  reason    String?
+  createdAt DateTime       @default(now()) @map("created_at")
+
+  // An officer can only vote once per batch per stage — enforced at DB level.
+  // This is a second line of defence after the SELECT FOR UPDATE in the service.
+  @@unique([batchId, officerId, stage])
+  @@map("batch_approvals")
+}
+
+// Append-only audit log — every state change writes a row here.
+// Never delete from this table. It is the source of truth for "who did what when".
+model BatchEvent {
+  id        String   @id @default(uuid())
+  batchId   String   @map("batch_id")
+  batch     Batch    @relation(fields: [batchId], references: [id])
+  eventType String   @map("event_type")
+  actorId   String?  @map("actor_id") // null for system events (SLA check, cron)
+  actor     User?    @relation(fields: [actorId], references: [id])
+  metadata  Json?    // flexible payload: old/new status, reason, counts, etc.
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@map("batch_events")
+}
+
+model WhatsappDelivery {
+  id                String         @id @default(uuid())
+  certificateId     String         @map("certificate_id")
+  certificate       Certificate    @relation(fields: [certificateId], references: [id])
+  phone             String
+  status            DeliveryStatus @default(PENDING)
+  attempts          Int            @default(0)
+  lastAttemptedAt   DateTime?      @map("last_attempted_at")
+  // Stored to detect if provider accepted but we lost the response — prevents double-send
+  providerMessageId String?        @map("provider_message_id")
+  createdAt         DateTime       @default(now()) @map("created_at")
+
+  @@map("whatsapp_deliveries")
+}

@@ -1,0 +1,165 @@
+﻿# =============================================================================
+# CertiFlow — Full Stack (Demo / Submission)
+# =============================================================================
+# Builds and runs everything: FE, BE, worker, and all infrastructure.
+# Use this for the final demo, reviewer setup, or CI.
+#
+# COMMANDS:
+#   First run (build + start): docker-compose up --build
+#   Start (already built):     docker-compose up
+#   Start (background):        docker-compose up -d
+#   Stop:                      docker-compose down
+#   Wipe data (full reset):    docker-compose down -v
+#   Scale workers:             docker-compose up --scale worker=3
+#   View logs:                 docker-compose logs -f backend
+#   View logs (worker):        docker-compose logs -f worker
+#
+# AFTER FIRST START — run migrations + seed in a second terminal:
+#   docker-compose exec backend npx --no prisma migrate deploy
+#   docker-compose exec backend npx --no ts-node prisma/seed.ts
+#
+# SERVICES:
+#   Frontend        http://localhost:5173
+#   API             http://localhost:3000
+#   S3 (LocalStack) http://localhost:4566   (S3-compatible, any key accepted)
+#   Mock WhatsApp   http://localhost:4000/messages  (inspect sent messages)
+# =============================================================================
+
+services:
+  # --- Infrastructure -------------------------------------------------------
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: certiflow
+      POSTGRES_USER: certiflow
+      POSTGRES_PASSWORD: certiflow
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    ports:
+      - '5432:5432'
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U certiflow']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - '6379:6379'
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # LocalStack — S3-compatible object storage, no Docker Hub auth required.
+  # Replaces MinIO (all MinIO image variants require registry login).
+  # The backend connects via the MinIO SDK pointed at port 4566 — same S3 API.
+  minio:
+    image: localstack/localstack:3.0
+    environment:
+      SERVICES: s3
+      AWS_DEFAULT_REGION: us-east-1
+      # LocalStack accepts any credentials in community edition
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+    volumes:
+      - minio_data:/var/lib/localstack
+    ports:
+      - '4566:4566'
+    healthcheck:
+      test: ['CMD', 'curl', '-f', 'http://localhost:4566/_localstack/health']
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # Mock WhatsApp provider — behaves like real one, including random failures/timeouts
+  mock-whatsapp:
+    build:
+      context: ./mock-whatsapp
+      dockerfile: Dockerfile
+    ports:
+      - '4000:4000'
+    environment:
+      PORT: 4000
+      FAILURE_RATE: '0.3'      # 30% random failure rate — tests BullMQ retry logic
+      TIMEOUT_RATE: '0.1'      # 10% chance of timing out
+
+  # --- Application ----------------------------------------------------------
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: node dist/server.js
+    ports:
+      - '3000:3000'
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      STORAGE_TYPE: s3
+      DATABASE_URL: postgresql://certiflow:certiflow@postgres:5432/certiflow
+      REDIS_URL: redis://redis:6379
+      JWT_SECRET: super-secret-jwt-key-change-in-production-must-be-32-chars
+      JWT_EXPIRES_IN: 7d
+      MINIO_ENDPOINT: minio
+      MINIO_PORT: 4566
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+      MINIO_BUCKET: certiflow
+      MINIO_USE_SSL: 'false'
+      WHATSAPP_MOCK_URL: http://mock-whatsapp:4000
+      FRONTEND_URL: http://localhost:5173
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+
+  # Worker runs the same image as backend but with a different entry point.
+  # Scale independently: docker-compose up --scale worker=3
+  # BullMQ distributes jobs across all worker instances automatically.
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: node dist/worker-entry.js
+    environment:
+      NODE_ENV: production
+      STORAGE_TYPE: s3
+      DATABASE_URL: postgresql://certiflow:certiflow@postgres:5432/certiflow
+      REDIS_URL: redis://redis:6379
+      JWT_SECRET: super-secret-jwt-key-change-in-production-must-be-32-chars
+      MINIO_ENDPOINT: minio
+      MINIO_PORT: 4566
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+      MINIO_BUCKET: certiflow
+      MINIO_USE_SSL: 'false'
+      WHATSAPP_MOCK_URL: http://mock-whatsapp:4000
+      FRONTEND_URL: http://localhost:5173
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - '5173:80'
+    depends_on:
+      - backend
+
+volumes:
+  pg_data:
+  minio_data:
